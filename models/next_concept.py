@@ -1,3 +1,21 @@
+"""Next-concept generator: predicts the multiscale code hierarchy of a VQ-VAE.
+
+The model conditions on a prefix (a prompt, a source sentence, or a single
+start token) and then generates codes coarse to fine. Every level is produced
+in ONE parallel pass over a shorter-or-equal sequence; the next level is
+conditioned on the accumulated latent of all previous levels. This is the
+"next-concept" alternative to token-by-token autoregressive decoding.
+
+Key ideas in this file:
+- the frozen VQ-VAE is stored as a 1-tuple so it stays out of the module tree
+  and the generator state dict;
+- attention is block-structured: prefix tokens see only the prefix, and each
+  target level sees the prefix plus itself (``block_diagonal``) or the prefix
+  plus itself and all coarser levels (``block_causal``);
+- RoPE positions restart at 0 for every target level, matching the per-level
+  sequence layout;
+- generation has an eager path and an optional prefix-KV-cache path.
+"""
 import math
 import torch
 import torch.nn as nn
@@ -7,6 +25,13 @@ from models.vqvae import VQVAE
 from utils.misc import count_params
 
 class _TiedCodebookHead(nn.Module):
+    """Output head tied to a VQ codebook: logits are negative squared distances.
+
+    Instead of learning an independent linear classifier, this projects the
+    hidden state into the code embedding space and scores every code by
+    ``2 z.E - ||E||^2`` (the ||z||^2 term is constant across the softmax).
+    """
+
     def __init__(self, n_embd, codebook, learn_scale=True, trainable=False, use_bias=False):
         super().__init__()
         V, d = codebook.shape
@@ -47,6 +72,7 @@ class _SharedHeadView(nn.Module):
 
 class _SharedHeads(nn.Module):
     # one projection shared by every level; with per_level_bias each level owns its bias
+    """Container that mimics a per-level head list while sharing one projection."""
     def __init__(self, head, n, per_level_bias=False):
         super().__init__()
         self.head = head
@@ -63,6 +89,14 @@ class _SharedHeads(nn.Module):
 
 
 class NextConceptTransformer(Transformer):
+    """Coarse-to-fine transformer over the VQ-VAE code hierarchy.
+
+    Shapes:
+    - prefix: B x P embeddings coming from the (frozen) VQ-VAE encoder, the
+      raw token embedding, or an optional text context encoder;
+    - target: B x sum(levels[1:]) embeddings, one chunk per generated level;
+    - output: one logits tensor per level, concatenated along the sequence.
+    """
 
     def __init__(self,
                  vqvae_local,
@@ -81,10 +115,13 @@ class NextConceptTransformer(Transformer):
         self.vqvae_local = (vqvae_local,)
 
         self.levels = self.vqvae_local[0].vq.levels
-        self.L = sum(self.levels)
+        self.L = sum(self.levels)  # total number of codes at all levels
 
         init_std = math.sqrt(1 / n_embd)
 
+        # query_level0: level 0 has only one code, so it is predicted from
+        # learned query tokens instead of being generated position by position.
+        # _lvl_first is the first level that lives in the target sequence.
         self.query_level0 = bool(getattr(config, 'query_level0', False))
         self.l0_ar = bool(getattr(config, 'l0_autoregressive', False)) and self.query_level0
         self._lvl_first = 0 if self.query_level0 else 1
@@ -104,6 +141,7 @@ class NextConceptTransformer(Transformer):
             head_dim = n_embd // config.n_head
             levels_target = self.levels[self._lvl_first:]
 
+            # One table for training/forward (prefix + all target levels) ...
             pos_full = torch.cat([
                 torch.arange(P, dtype=torch.long),
                 *[torch.arange(l, dtype=torch.long) for l in levels_target],
@@ -112,6 +150,8 @@ class NextConceptTransformer(Transformer):
             self.register_buffer('rope_cos', cos_full, persistent=False)
             self.register_buffer('rope_sin', sin_full, persistent=False)
 
+            # ... and one small table per generated level for generation, where
+            # positions restart at 0 inside each level's chunk.
             for k, l_k in enumerate(levels_target):
                 pos_k = torch.cat([
                     torch.arange(P, dtype=torch.long),
@@ -134,6 +174,7 @@ class NextConceptTransformer(Transformer):
         self.transformer = nn.ModuleDict(dict())
 
         self.transformer.update(dict(
+            # Projects VQ-VAE latents (embed_dim) into the generator width.
             wte = nn.Linear(self.vqvae_local[0].embed_dim, n_embd, bias=bias)
         ))
 
@@ -211,6 +252,7 @@ class NextConceptTransformer(Transformer):
         ))
 
         _n_heads = len(self.levels) - (0 if self.query_level0 else 1)
+        # One output head per generated level; vocab sizes may differ per level.
         assert len(vocab_size) == _n_heads, \
             f"vocab_size length {len(vocab_size)} must equal {_n_heads} " \
             f"(query_level0={self.query_level0}, levels={len(self.levels)})"
@@ -242,6 +284,7 @@ class NextConceptTransformer(Transformer):
             ])
 
         if self.query_level0:
+            # Learned queries that stand in for the (single) level-0 position.
             self.l0_queries = nn.Parameter(
                 torch.zeros(1, self.levels[0], self.vqvae_local[0].embed_dim))
             nn.init.trunc_normal_(self.l0_queries, mean=0.0, std=init_std)
@@ -276,14 +319,20 @@ class NextConceptTransformer(Transformer):
         self.register_buffer('lvl_1L', lvl_1L)
 
         if attn_pattern == 'block_diagonal':
+            # Every target position may attend only to positions of its own level.
             target_mask = torch.where(d == dT, 0., -torch.inf).reshape(T, T)
         else:
+            # 'block_causal': a level may also see all coarser levels.
             target_mask = torch.where(d >= dT, 0., -torch.inf).reshape(T, T)
         if self.l0_ar:
+            # Level 0 (when generated) is autoregressive within its chunk.
             _l0 = self.levels[0]
             target_mask[:_l0, :_l0] = torch.triu(
                 torch.full((_l0, _l0), -torch.inf), diagonal=1)
 
+        # Full mask over [prefix ; target]. Prefix rows only see the prefix
+        # (top-right is -inf); target rows see the prefix and the allowed
+        # target positions.
         top_left    = torch.zeros(P, P)
         top_right   = torch.full((P, T), -torch.inf)
         bottom_left = torch.zeros(T, P)
@@ -315,6 +364,7 @@ class NextConceptTransformer(Transformer):
         print("NCP Transformer, Non embedding parameter count: %.2fM" % (non_embd_params/1e6,))
         
     def _get_flex_block_mask(self, device):
+        """Build (and cache) the flex-attention block mask for the full sequence."""
         key = str(device)
         if key not in self._flex_block_masks:
             from torch.nn.attention.flex_attention import create_block_mask
@@ -360,6 +410,11 @@ class NextConceptTransformer(Transformer):
         return chunk + delta
 
     def _encode_context(self, prefix_ids):
+        """Encode a raw-token prefix with the optional context encoder.
+
+        Two options: a pretrained (usually frozen) T5 encoder, or a small local
+        stack trained with the generator. Returns B x P x n_embd.
+        """
         if self.ctx_pretrained:
             am = (prefix_ids != self.ctx_pad_id).long()
             if self.ctx_t5_finetune:
@@ -379,6 +434,12 @@ class NextConceptTransformer(Transformer):
         return self.ctx_ln(h)
 
     def forward(self, x, prefix_ids=None, prefix_pad_mask=None):
+        """Training path: prefix latents (first P positions) + target latents.
+
+        ``x`` is the concatenation of the prefix latent and the per-level
+        target latents, exactly what ``VQVAE.get_ncm_inputs`` returns. Returns
+        concatenated logits for all generated levels.
+        """
         if self.use_ctx_encoder:
             assert prefix_ids is not None, "ctx_encoder requires prefix_ids"
             prefix_emb = self._encode_context(prefix_ids)
@@ -440,6 +501,7 @@ class NextConceptTransformer(Transformer):
         return x.gather(1, pos[:, :, None].expand(-1, -1, x.shape[-1]))
 
     def _run_stack(self, prefix_emb, x, prefix_pad_mask=None):
+        """Run the prefix and target through the transformer and project logits."""
         x = torch.cat([prefix_emb, x], dim=1)
 
         attn_mask = self.attn_mask_for_masking
@@ -470,6 +532,11 @@ class NextConceptTransformer(Transformer):
 
 
     def _pad_vocab(self, logits):
+        """Right-pad logits to the largest vocabulary with -inf.
+
+        Different levels may have different codebook sizes; padding lets the
+        per-level logits be concatenated/sampled uniformly.
+        """
         pad = self.max_vocab - logits.shape[-1]
         if pad == 0:
             return logits
@@ -491,6 +558,12 @@ class NextConceptTransformer(Transformer):
         return self.lm_heads[hidx](self.transformer.ln_f(x))
 
     def _sample_level(self, logits, temperature, top_k, top_p):
+        """CFG-aware wrapper around ``_sample_level_raw``.
+
+        With classifier-free guidance the batch is doubled: rows [0:B] are the
+        conditional logits and [B:2B] the null-prefix logits. The guidance
+        weight grows with the level index (coarse levels are guided less).
+        """
         _c = getattr(self, "_cfg", None)
         if _c is not None and _c["scale"] > 0.0:
             B = _c["B"]
@@ -501,6 +574,7 @@ class NextConceptTransformer(Transformer):
         return self._sample_level_raw(logits, temperature, top_k, top_p)
 
     def _sample_level_raw(self, logits, temperature, top_k, top_p):
+        """Temperature / top-k / top-p sampling; temperature 0 means argmax."""
         if temperature == 0:
             return logits.argmax(dim=-1)
         logits_flat = logits.reshape(-1, logits.shape[-1]) / temperature
@@ -536,6 +610,21 @@ class NextConceptTransformer(Transformer):
     @torch.no_grad()
     def generate(self, idx, prefix_tokens, temperature=1.0, top_k=50, top_p=0.9,
                  use_kv_cache=False, cfg_scale=0.0, cfg_null_eos=50256):
+        """Generate the full code hierarchy for a batch of prefixes.
+
+        Args:
+            idx: optional level-0 codes (B x levels[0]). If None, level 0 is
+                produced from the learned query tokens / level-0 head.
+            prefix_tokens: B x P prefix ids (text tokens or VQ-VAE pre-tokens).
+            temperature/top_k/top_p: sampling controls; temperature 0 = argmax.
+            use_kv_cache: encode the prefix once and reuse its K/V at each
+                level instead of re-running the prefix every time.
+            cfg_scale: classifier-free guidance weight; 0 disables it.
+            cfg_null_eos: token used as the first token of the null prefix.
+
+        Returns:
+            B x sum(levels) codes, ordered coarse to fine (level 0 first).
+        """
         assert not (self.l0_ar and use_kv_cache), \
             "autoregressive level-0 generation supports the eager path only"
 
@@ -557,12 +646,16 @@ class NextConceptTransformer(Transformer):
 
         B = prefix_tokens.shape[0]
         vq = self.vqvae_local[0].vq
+        # Running reconstruction, updated level by level.
         z_hat = torch.zeros(B, self.levels[-1], self.vqvae_local[0].embed_dim, device=dev)
 
+        # ---- Encode the prefix -------------------------------------------------
         if self.use_ctx_encoder:
             prefix_emb = self._encode_context(prefix_tokens[:, :self.prefix_len])
         else:
             if self.raw_token_prefix:
+                # Prefix ids are already pre-tokens: either a plain embedding
+                # lookup or a contextual encoder pass over them.
                 _enc = self.vqvae_local[0].encoder
                 if self.contextual_prefix and \
                         len(getattr(_enc, 'blocks', [])) > 0:
@@ -570,11 +663,14 @@ class NextConceptTransformer(Transformer):
                 else:
                     z_prefix = _enc.wte(prefix_tokens)[:, :self.prefix_len, :]
             else:
+                # Text prefix: let the frozen VQ-VAE encoder produce latents.
                 z_prefix = self.vqvae_local[0].encode_z(prefix_tokens)[:, :self.prefix_len, :]
             prefix_emb = self.transformer.wte(z_prefix)
         if not self.use_rope:
             prefix_emb = prefix_emb + self.wpe(self.wp_prefix)
 
+        # Level and positional embeddings for the target chunks. RoPE is
+        # applied inside attention; wpe/wle are used otherwise.
         if self.config.use_level_encoding:
             level_pos_embed = self.transformer.wle(self.lvl_1L)
         else:
@@ -588,6 +684,7 @@ class NextConceptTransformer(Transformer):
 
         _pbias = None
         if self.prefix_pad_id is not None:
+            # Masked (pad) prefix positions get -inf so they cannot be attended.
             _pm = (prefix_tokens[:, :P] == self.prefix_pad_id)
             _pbias = torch.zeros(_pm.shape[0], 1, 1, P, device=dev)
             _pbias[:, :, :, :P] = torch.where(
@@ -596,6 +693,7 @@ class NextConceptTransformer(Transformer):
                 torch.tensor(0.0, device=dev))
 
         if idx is None and self.query_level0:
+            # ---- Level 0 from learned queries (one parallel pass) ------------
             l0 = self.levels[0]
             _q0 = self.build_l0_query_input(B, prefix_emb.dtype)
             if self.use_post_upsample_conv:
@@ -654,6 +752,8 @@ class NextConceptTransformer(Transformer):
                 idx = self._sample_level(self.lm_heads[0](h[:, P:, :]), temperature, top_k, top_p)
 
         if idx is None:
+            # ---- Level 0 from the prefix (predict_level0) --------------------
+            # Reads the last levels[0] prefix positions and projects them.
             assert self.predict_level0, "generate(idx=None) requires model.predict_level0 or query_level0"
             rope_p = (self.rope_cos_gen_0, self.rope_sin_gen_0) if self.use_rope else None
             h = prefix_emb
@@ -681,10 +781,13 @@ class NextConceptTransformer(Transformer):
             _, prefix_kv = self._kv_prefix(prefix_emb, pfx_mask, rope_p)
 
         level_acum = self.levels[0] if self.query_level0 else 0
+        # ---- Levels 1..K: one parallel pass per level ------------------------
         for level_idx in range(len(self.levels)-1):
             if self._cfg is not None:
                 self._cfg["level"] = level_idx + 1
 
+            # Embed the codes just sampled, add them to the running latent and
+            # feed the reconstruction for this level to the transformer.
             z_q_level = vq.embeddings[level_idx](idx_next)
             z_hat, x = vq.get_next_autoregressive_input(level_idx, z_hat, z_q_level)
 
@@ -702,12 +805,14 @@ class NextConceptTransformer(Transformer):
             ) if self.use_rope else None
 
             if use_kv_cache:
+                # Target rows only: the prefix K/V is already cached.
                 lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
                 if _pbias is not None:
                     lvl_mask = lvl_mask + F.pad(_pbias, (0, L_cur))
                 logits = self._kv_level(x, prefix_kv, lvl_mask, rope_k, _hi)
             else:
                 logits = self._decode_level_logits(x, prefix_emb, level_idx, _pbias, hidx=_hi)
+            # All positions of this level are sampled in parallel.
             idx_next = self._sample_level(logits, temperature, top_k, top_p)
 
             generated_idx.append(idx_next)

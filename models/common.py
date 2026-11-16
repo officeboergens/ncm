@@ -1,7 +1,16 @@
+"""Transformer building blocks shared by the generator and the VQ-VAE.
+
+Contains RoPE helpers, normalization layers, a GPT-style attention block with
+optional grouped-query attention (GQA), QK norm, KV-cache support and optional
+local/flex attention, plus several MLP and residual-scaling variants that are
+enabled by flags in the model config.
+"""
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# PyTorch's fused flex-attention is optional; configs that request it need a
+# build where this import succeeds.
 try:
     from torch.nn.attention.flex_attention import flex_attention as _flex_attention
     HAS_FLEX_ATTENTION = True
@@ -11,8 +20,16 @@ except ImportError:
 
 
 def precompute_rope_cos_sin(positions, head_dim, base=10000):
+    """Precompute rotary embeddings for the given integer positions.
+
+    Returns cos/sin tensors of shape (len(positions), head_dim). The frequencies
+    are duplicated across the two halves so that ``apply_rotary_emb`` can treat
+    the head vector as (x1, x2) pairs.
+    """
     assert head_dim % 2 == 0, f"head_dim must be even for RoPE, got {head_dim}"
     half = head_dim // 2
+    # theta_i = base^(-2i/d), expressed with half the exponent because the
+    # cos/sin tables are duplicated afterwards.
     inv_freq = 1.0 / (base ** (torch.arange(0, half, dtype=torch.float32) / half))
     freqs = positions.float()[:, None] * inv_freq[None, :]
     cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)
@@ -21,16 +38,19 @@ def precompute_rope_cos_sin(positions, head_dim, base=10000):
 
 
 def apply_rotary_emb(x, cos, sin):
+    """Rotate (..., head_dim) vectors by the supplied cos/sin tables."""
     cos = cos.to(x.dtype)
     sin = sin.to(x.dtype)
     half = x.shape[-1] // 2
     x1 = x[..., :half]
     x2 = x[..., half:]
+    # Rotate by 90 degrees: (x1, x2) -> (-x2, x1); then blend by angle.
     rotated = torch.cat([-x2, x1], dim=-1)
     return x * cos + rotated * sin
 
 
 class LayerNorm(nn.Module):
+    """LayerNorm with an optional bias (bias is off in most configs)."""
     def __init__(self, ndim, bias=False):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
@@ -41,6 +61,10 @@ class LayerNorm(nn.Module):
 
 
 class RMSNorm(nn.Module):
+    """Root-mean-square norm, applied per head for QK norm.
+
+    Computed in fp32 and cast back, matching the Llama-style implementation.
+    """
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -62,6 +86,7 @@ class SelfAttention(nn.Module):
         assert config.n_head % self.n_kv_head == 0, "n_head must be divisible by n_kv_heads"
         _hd = config.n_embd // config.n_head
         self._kv_dim = self.n_kv_head * _hd
+        # One fused projection produces queries plus (possibly fewer) keys/values.
         self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * self._kv_dim, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -80,14 +105,20 @@ class SelfAttention(nn.Module):
 
     def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None, past_kv=None, return_kv=False):
         """past_kv=(k, v) from an earlier call is attended over before x; return_kv=True also returns this
-        call's rotated (k, v). Nothing is stored on the module."""
+        call's rotated (k, v). Nothing is stored on the module.
+
+        Keeping the cache in arguments instead of module state makes the same
+        block usable by both the fused eager path and a torch.compile'd path.
+        """
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split([self.n_embd, self._kv_dim, self._kv_dim], dim=2)
         hd = C // self.n_head
+        # (B, T, C) -> (B, heads, T, head_dim)
         q = q.view(B, T, self.n_head, hd).transpose(1, 2)
         k = k.view(B, T, self.n_kv_head, hd).transpose(1, 2)
         v = v.view(B, T, self.n_kv_head, hd).transpose(1, 2)
         if self.n_kv_head != self.n_head:
+            # GQA: repeat each K/V head so it lines up with the query heads.
             rep = self.n_head // self.n_kv_head
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
@@ -108,6 +139,7 @@ class SelfAttention(nn.Module):
         # k (without RoPE) and v are views into the fused qkv output; copy them so a kept cache doesn't hold it.
         new_kv = (k.contiguous(), v.contiguous()) if return_kv else None
         if past_kv is not None:
+            # A cached call attends to the previous K/V followed by the new ones.
             k = torch.cat([past_kv[0], k], dim=2)
             v = torch.cat([past_kv[1], v], dim=2)
 
@@ -127,6 +159,12 @@ class SelfAttention(nn.Module):
         return (y, new_kv) if return_kv else y
 
 class MLP(nn.Module):
+    """Feed-forward block; the variant is chosen by config flags.
+
+    - default: Linear -> GELU -> Linear with a 4x (or `mlp_ratio`) hidden size;
+    - SwiGLU/GEGLU: gated two-projection variant, hidden size ~8/3*n_embd;
+    - relu2: ReLU squared activation, as used in some diffusion transformers.
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -135,6 +173,7 @@ class MLP(nn.Module):
         self.use_relu2  = bool(getattr(config, "use_relu2", False))
         self.gated_ffn  = self.use_swiglu or self.use_geglu
         if self.gated_ffn:
+            # Rounded to a multiple of 8 for tensor-core friendliness.
             h = int(round(8 * config.n_embd / 3 / 8) * 8)
             self.w_gate = nn.Linear(config.n_embd, h, bias=config.bias)
             self.w_up   = nn.Linear(config.n_embd, h, bias=config.bias)
@@ -159,7 +198,16 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    
+    """Pre-norm transformer block with optional parallel attention/MLP and scaling.
+
+    Variants:
+    - ``parallel_block``: attention and MLP both read the same normalized input
+      and are added to the residual stream together (GPT-J style);
+    - ``normformer``: extra LayerNorms on the attention/MLP outputs;
+    - ``use_layerscale`` / ``use_rezero``: learnable per-channel/per-branch
+      scales on the residual branches.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -182,6 +230,7 @@ class Block(nn.Module):
             self.rz2 = nn.Parameter(torch.zeros(1))
 
     def _ls_scale(self, h, which):
+        """Apply the residual-branch scale for branch 1 (attn) or 2 (MLP)."""
         if self.use_layerscale:
             return (self.ls1 if which == 1 else self.ls2) * h
         if self.use_rezero:
@@ -191,6 +240,7 @@ class Block(nn.Module):
     def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None, past_kv=None, return_kv=False):
         kv = dict(past_kv=past_kv, return_kv=return_kv)
         if self.parallel_block:
+            # Both branches use the same pre-norm; their outputs are summed once.
             n = self.ln_1(x)
             a = self.attn(n, attn_mask, rope_cos_sin=rope_cos_sin, block_mask=block_mask, **kv)
             if return_kv:
@@ -200,6 +250,7 @@ class Block(nn.Module):
                 a = self.ln_post_attn(a); m = self.ln_post_mlp(m)
             x = x + self._ls_scale(a, 1) + self._ls_scale(m, 2)
             return (x, new_kv) if return_kv else x
+        # Standard sequential block: attention then MLP, each pre-normed.
         a = self.attn(self.ln_1(x), attn_mask, rope_cos_sin=rope_cos_sin, block_mask=block_mask, **kv)
         if return_kv:
             a, new_kv = a
@@ -211,11 +262,12 @@ class Block(nn.Module):
             m = self.ln_post_mlp(m)
         x = x + self._ls_scale(m, 2)
         return (x, new_kv) if return_kv else x
-    
+
 class Transformer(nn.Module):
+    """Minimal base class: weight init and the interface subclasses implement."""
     def __init__(self):
         super().__init__()
-        
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -223,15 +275,15 @@ class Transformer(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
+
     def get_num_params(self, non_embedding=True):
         _ = non_embedding
         raise NotImplementedError("This method should be implemented in subclasses.")
-    
+
     def forward(self, x):
         _ = x
         raise NotImplementedError("This method should be implemented in subclasses.")
-    
+
     def generate(self, idx):
         _ = idx
         raise NotImplementedError("This method should be implemented in subclasses.")

@@ -1,0 +1,31 @@
+{
+  "name": "mncm",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": false,
+  "workspaceFolder": "/workspaces/mncm",
+  "mounts": [
+    "source=mncm-pixi,target=/workspaces/mncm/.pixi,type=volume",
+    "source=docker_test-opencode-config,target=/home/vscode/.config/opencode,type=volume"
+  ],
+  "postCreateCommand": "pixi install",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "charliermarsh.ruff",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "${containerWorkspaceFolder}/.pixi/envs/default/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}
