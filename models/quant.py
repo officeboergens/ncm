@@ -1,3 +1,24 @@
+"""Multiscale residual vector quantization.
+
+One latent sequence z is represented by K code sequences with increasing
+length (``levels``), coarse to fine. Each level quantizes the *residual* left
+by the previous levels, so the accumulated ``z_hat`` gets progressively more
+accurate:
+
+    residual = z
+    for level in levels:
+        residual_at_level = down(residual)
+        code     = nearest_neighbour(residual_at_level, level_codebook)
+        decoded  = phi(up(codebook[code]))   # upsample, then residual conv
+        z_hat   += decoded
+        residual -= decoded
+
+The codebook is updated with EMA (no gradients), and the down/up sampling can
+be fixed interpolation or learned strided convolutions (``learned_l1_*``).
+The public helpers used at inference are ``z_to_idx`` (latents -> codes),
+``idx_to_zhats`` / ``idx_to_z_q`` (codes -> latents) and
+``get_next_autoregressive_input`` (feeds the previous level to the generator).
+"""
 import math
 import numpy as np
 import torch
@@ -21,6 +42,7 @@ def area_resize(x_BCL, size):
 
 
 # Phi (quant_resi): per-level residual conv after upsample, blending (1-r)*h + r*Conv1d(h).
+# The blend ratio can be fixed or learned (sigmoid of a scalar parameter).
 class Phi(nn.Conv1d):
     def __init__(self, embed_dim, quant_resi, learnable_ratio=False):
         ks = 3
@@ -52,6 +74,10 @@ class Phi(nn.Conv1d):
 
 
 class PhiConvStack(nn.Module):
+    """Stronger replacement for Phi: a 3-layer residual conv stack.
+
+    The final conv is zero-initialized so training starts from the identity.
+    """
     def __init__(self, embed_dim, kernel_size=3, hidden_mult=1):
         super().__init__()
         ks = kernel_size
@@ -72,6 +98,11 @@ class PhiConvStack(nn.Module):
         return h_BCL + y
 
 
+# The three Phi containers implement `share_mode`:
+#   PhiShared            -> one residual conv for all levels;
+#   PhiPartiallyShared   -> `share_mode` convs, selected by closest tick;
+#   PhiNonShared         -> one conv per level.
+# They are indexed by a position in [0, 1] (coarse -> fine) at call time.
 class PhiShared(nn.Module):
     def __init__(self, qresi):
         super().__init__()
@@ -119,6 +150,7 @@ def _cfg_get(cfg, key, default):
 
 
 def _build_quant_resi(embed_dim, num_levels, quant_resi_config):
+    """Build the level-indexed residual-conv container from the YAML config."""
     enabled = bool(_cfg_get(quant_resi_config, 'enabled', True))
     if not enabled:
         return None
@@ -156,6 +188,7 @@ def _build_quant_resi(embed_dim, num_levels, quant_resi_config):
     return PhiPartiallyShared(nn.ModuleList([make_phi(ratios_per_level[0]) for _ in range(share_mode)]))
 
 def _make_learned_down_l1(D, stride=4):
+    """Strided conv initialized to exact average pooling (one tap per bin)."""
     conv = nn.Conv1d(D, D, kernel_size=stride, stride=stride, bias=True)
     with torch.no_grad():
         conv.weight.zero_()
@@ -166,6 +199,7 @@ def _make_learned_down_l1(D, stride=4):
 
 
 def _make_learned_up_l1(D, stride=4):
+    """Transposed conv initialized to nearest-neighbour upsampling."""
     convT = nn.ConvTranspose1d(D, D, kernel_size=stride, stride=stride, bias=True)
     with torch.no_grad():
         convT.weight.zero_()
@@ -176,6 +210,7 @@ def _make_learned_up_l1(D, stride=4):
 
 
 def _plan_cascade_strides(total_stride, base=4):
+    """Factor a total stride into a chain of strides <= base (e.g. 64 -> [4, 4, 4])."""
     S = int(total_stride)
     strides = []
     while S > 1:
@@ -218,6 +253,7 @@ def _make_cascaded_up_l1(D, total_stride, base=4, inter_norm=False):
 
 
 def _make_zeroinit_residual_conv(D, kernel_size=3):
+    """Residual conv that starts as a no-op (zero weights and bias)."""
     pad = kernel_size // 2
     conv = nn.Conv1d(D, D, kernel_size=kernel_size, stride=1, padding=pad, bias=True)
     with torch.no_grad():
@@ -239,6 +275,15 @@ class VectorQuantizerBaseClass(nn.Module):
         return cls(**{k: v for k, v in config.items() if k != "clss"})
 
 class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
+    """Residual VQ over a hierarchy of sequence lengths.
+
+    ``levels`` lists the sequence length of each level (coarse -> fine, the
+    last one is the full latent length). Every level has its own codebook
+    (``embeddings[i]``) and its own EMA statistics. At training time the
+    forward pass returns the reconstruction plus VQ loss/utilization stats; at
+    inference the ``*_to_*`` helpers convert between latents and codes.
+    """
+
     def __init__(
         self,
         vqvae_vocab_size,
@@ -265,6 +310,7 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
         self.embed_dim = embed_dim
         self.commitment_cost = commitment_cost
         self.epsilon = epsilon
+        # EMA decay can be global or one value per level.
         self.ema_scale_by_world_size = bool(ema_scale_by_world_size)
         if isinstance(decay, (list, tuple)):
             self.base_decay = float(decay[0])
@@ -298,6 +344,7 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
         if levels.use_manual_levels:
             self.levels = levels.manual_levels
         else:
+            # Use one of the schedules in utils/registry.py (linear, exp, ...).
             self.levels = level_schedulers[levels.scheduler](levels.start, levels.end, levels.num_levels)
 
         assert len(vqvae_vocab_size) == len(self.levels), \
@@ -311,6 +358,8 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
         for emb in self.embeddings:
             emb.weight.data.normal_()
             emb.weight.requires_grad_(False)
+        # Per-level EMA state: cluster mass, cluster mean and a hit flag used
+        # only for reporting codebook utilization.
         for i, vs in enumerate(self.vqvae_vocab_sizes):
             self.register_buffer(f'ema_cluster_size_{i}', torch.zeros(vs))
             self.register_buffer(f'ema_w_{i}', self.embeddings[i].weight.data.clone())
@@ -478,16 +527,22 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
         num_levels = len(self.levels)
         decay = self._get_ema_decay()
 
+        # `z_rest` is the part of z not yet explained; `z_hat` is the running
+        # reconstruction. Every level quantizes the current residual.
         for i, level in enumerate(self.levels):
             emb_i = self.embeddings[i]
             vs_i = self.vqvae_vocab_sizes[i]
 
+            # Bring the residual to this level's sequence length. The finest
+            # level keeps the full length.
             if i != num_levels - 1:
                 flat_input_BLC = self._down_for_quant(z_rest, i, level)
             else:
                 flat_input_BLC = z_rest
             flat_input = flat_input_BLC.reshape(-1, C)
 
+            # Nearest codebook entry (squared L2 distance expanded to avoid a
+            # B x V x C tensor).
             distances = self._distances(flat_input, emb_i.weight)
 
             indices = torch.argmin(distances, dim=1).view(B, level)
@@ -496,6 +551,7 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
             encodings.scatter_(1, indices.view(-1, 1), 1)
 
             if self.training:
+                # EMA codebook update, optionally averaged across DDP ranks.
                 decay = self._get_ema_decay_level(i)
                 ema_cs = getattr(self, f'ema_cluster_size_{i}')
                 ema_w = getattr(self, f'ema_w_{i}')
@@ -517,6 +573,8 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
             if i == 0 and self.learned_l1_sampling:
                 q_BLC = flat_input_BLC + (q_BLC - flat_input_BLC).detach()
 
+            # Upsample the quantized level back to full length before adding it
+            # to the reconstruction (except for the finest level).
             if i != num_levels - 1:
                 quantized = self._up_to_full(q_BLC, i, L)
             else:
@@ -529,18 +587,24 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
                 z_hat_keep.append(z_hat)
             z_rest = z_rest - quantized
 
+            # Commitment term keeps the encoder near its chosen codes; the
+            # reconstruction term keeps the accumulated z_hat near z.
             vq_loss = vq_loss + self.commitment_cost * F.mse_loss(z_hat.detach(), z)
             vq_loss = vq_loss + F.mse_loss(z_hat, z_no_grad)
 
+            # Mark which codes were used since the last reset (metrics only).
             getattr(self, f'codebook_hit_{i}')[indices.view(B * level)] = 1
 
         vq_loss = vq_loss / num_levels
+        # Fine-level dropout (training only): sometimes decode from a randomly
+        # truncated level so the decoder tolerates coarse samples.
         if do_fine_drop and len(z_hat_keep) >= 2:
             kmin = max(self.fine_drop_min_keep - 1, 0)
             kmax = len(z_hat_keep) - 2
             if kmax >= kmin:
                 K = int(torch.randint(kmin, kmax + 1, ()))
                 z_hat = z_hat_keep[K]
+        # Straight-through: forward uses z_hat, backward flows to the encoder.
         z_hat = z + (z_hat - z).detach()
 
         per_level_codebook_utilization = [
@@ -563,6 +627,11 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
 
     @torch.no_grad()
     def set_stochastic_encode(self, enabled, temperature=0.5, top_k=10, top_p=0.95):
+        """Switch z_to_idx between argmin and sampling from the distance logits.
+
+        Sampling is useful for data augmentation or stochastic tokenization;
+        evaluation uses the deterministic argmin path.
+        """
         self._stoch_encode = bool(enabled)
         self._stoch_temp = float(temperature)
         self._stoch_top_k = int(top_k)
@@ -584,6 +653,11 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
         return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).squeeze(-1)
 
     def z_to_idx(self, z, return_zhats=False, return_zlevels=False):
+        """Encode latents to the flattened code hierarchy (coarse -> fine).
+
+        Optionally also returns the cumulative reconstructions ``z_hats`` and
+        per-level reconstructions ``z_levels`` (used for visualization).
+        """
         z = z.float()
         B, L, C = z.shape
         z_no_grad = z.detach()
@@ -644,6 +718,13 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
 
     @torch.no_grad()
     def idx_to_zhats(self, idx, return_zlevels=True):
+        """Decode the flattened code hierarchy back to latents.
+
+        Returns ``(z_hats, z_levels)`` where ``z_hats[i]`` is the cumulative
+        reconstruction after level i at full length and ``z_levels[i]`` is the
+        same reconstruction resized to level i's length. ``z_levels[-1]`` is
+        the full-resolution latent normally fed to the decoder.
+        """
         z_hats = []
         z_levels = []
         z_hat = torch.zeros(
@@ -659,7 +740,9 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
             else:
                 z_q_level = emb_at_level
             z_q_level = self._apply_quant_resi(z_q_level, level_idx)
-            z_hat.add_(z_q_level)
+            # Out-of-place add: `z_hats` must keep one snapshot per level, so
+            # the list must not alias the running tensor.
+            z_hat = z_hat + z_q_level
             z_hats.append(z_hat)
             if return_zlevels:
                 z_levels.append(
@@ -676,6 +759,12 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
 
     @torch.no_grad()
     def idx_to_ncm_input(self, idx):
+        """Build the generator's per-level inputs from a full code sequence.
+
+        For every level except the last, the cumulative reconstruction is
+        resized to the *next* level's length. Concatenating these gives the
+        coarse-to-fine input sequence used during next-concept training.
+        """
         next_concepts = []
         z_hat = torch.zeros(
             idx.shape[0], self.levels[-1], self.embed_dim, device=idx.device
@@ -698,6 +787,13 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
 
     @torch.no_grad()
     def get_next_autoregressive_input(self, level_idx, z_hat, z_q_level):
+        """Advance the reconstructed latent by one level during generation.
+
+        ``z_hat`` is the running reconstruction and ``z_q_level`` the newly
+        sampled codes at ``level_idx``. Returns the updated ``z_hat`` and the
+        tensor the generator should consume next: the reconstruction resized
+        to the following level's length (or the full latent at the last level).
+        """
         n_levels = len(self.levels)
         if level_idx != n_levels - 1:
             upsampled = self._up_to_full(z_q_level, level_idx, self.levels[-1])
@@ -711,6 +807,7 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
 
     @torch.no_grad()
     def idx_to_z_q(self, indices):
+        """Codes -> the final cumulative full-resolution latent (no z_levels)."""
         z_hat = torch.zeros(indices.shape[0], self.levels[-1], self.embed_dim, device=indices.device)
 
         level_accum = 0

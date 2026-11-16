@@ -71,7 +71,10 @@ P = int(CFG.model.prefix_len)
 
 items = pickle.load(open(os.path.join(dd, CFG.data.test), "rb"))[:a.n]
 refs = pickle.load(open(os.path.join(dd, CFG.data.test_refs), "rb"))[:a.n]
+# Text tasks need an HF tokenizer to build the prefix; Sudoku inputs are
+# already id lists and keep src_tok=None.
 src_tok = AutoTokenizer.from_pretrained(str(CFG.tokenizer.pre_tokenizer.model_id)) if isinstance(items[0], str) else None
+# Truncate/pad every input to the generator's prefix length.
 X = torch.tensor([((src_tok(i)["input_ids"] if src_tok else list(i))[:P] + [PAD] * P)[:P] for i in items], device=DEV)
 n = X.shape[0]
 
@@ -83,6 +86,7 @@ def dec(ids):
 
 @torch.no_grad()
 def run(x, kv):
+    """Generate codes (optionally with the prefix KV cache) and argmax-decode them."""
     torch.manual_seed(0)
     g = net.generate(None, x, temperature=temp, top_k=top_k, top_p=top_p, cfg_scale=cfg, cfg_null_eos=EOS, use_kv_cache=kv)
     _, zl = tk.vqvae.vq.idx_to_zhats(g, return_zlevels=True)
@@ -90,6 +94,7 @@ def run(x, kv):
 
 
 def metric(hyps):
+    """Task metric used to verify that both generation paths give the same quality."""
     ref_txt = [r if isinstance(r, str) else dec(list(r)) for r in refs]
     if CFG.eval.metric == "bleu":
         import sacrebleu
@@ -109,16 +114,18 @@ results, base = [], None
 for mode in a.modes.split(","):
     assert mode in ("eager", "kv"), f"bad mode {mode}"
     kv = mode == "kv"
-    run(X[:a.bs], kv)  # warmup
+    run(X[:a.bs], kv)  # warmup (allocations, caches, compile)
     sync()
     if DEV == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    # Time only the generation loop, not tokenization or scoring.
     outs, t = [], time.perf_counter()
     for s in range(0, n, a.bs):
         outs.append(run(X[s:s + a.bs], kv))
     sync(); dt = time.perf_counter() - t
     out = torch.cat(outs).cpu()
     base = out if base is None else base
+    # With deterministic decoding both paths should produce identical codes.
     same = (out == base).all(1).float().mean().item()
     mname, mval = metric([dec(r) for r in out.tolist()])
     r = dict(task=CFG.task, mode=mode, device=name, n=n, bs=a.bs, cfg=cfg, seconds=dt, seq_per_s=n / dt,

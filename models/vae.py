@@ -1,3 +1,14 @@
+"""Encoder/Decoder networks used by the multiscale VQ-VAE.
+
+These are deliberately small transformer/convolution stacks. The encoder maps
+a fixed-length sequence of pre-token ids to a latent sequence; the decoder
+maps latents back to pre-token logits. The hierarchy of discrete codes lives
+in ``models/quant.py``, between these two networks.
+
+Note the naming convention inherited from the original code: the ``n_layers``
+argument is used as the attention *head count* inside the blocks, while
+``enc_layers``/``dec_layers`` control depth.
+"""
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -14,6 +25,7 @@ class LayerNorm(nn.Module):
 
 
 class RMSNorm(nn.Module):
+    """Root-mean-square norm applied per head (used for QK norm)."""
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -21,7 +33,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         orig_dtype = x.dtype
-        x_f = x.float()
+        x_f = x.float()  # compute the norm in fp32 for stability
         rms = x_f.pow(2).mean(dim=-1, keepdim=True).add_(self.eps).rsqrt_()
         return (x_f * rms).to(orig_dtype) * self.weight
 
@@ -30,6 +42,7 @@ class SelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        # Fused QKV projection.
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -47,12 +60,14 @@ class SelfAttention(nn.Module):
         assert hasattr(torch.nn.functional, "scaled_dot_product_attention")
 
     def _window_mask(self, T, device):
+        """Boolean band mask: position i attends to positions within +/- w."""
         i = torch.arange(T, device=device)
         return (i[:, None] - i[None, :]).abs() <= self.attn_window
 
     def forward(self, x):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        # (B, T, C) -> (B, heads, T, head_dim)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -71,6 +86,7 @@ class SelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """Standard 4x feed-forward network with GELU."""
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
@@ -87,6 +103,7 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
+    """Pre-norm transformer block: attention then MLP, both residual."""
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -123,10 +140,14 @@ class Encoder(nn.Module):
 
         assert compression_factor ==1 or compression_factor % 2 == 0, "Compression factor must be a power of 2"
         self.compression_factor = compression_factor
+        # Token embedding is the whole encoder in the released models
+        # (enc_layers=0, enc_conv_layers=0); the optional stacks below are for
+        # variants trained with a deeper encoder.
         self.wte = nn.Embedding(in_vocab_size, embed_dim)
         self.wpe = nn.Embedding(context_length, embed_dim) if use_pos_emb else None
         self.drop = nn.Dropout(dropout)
 
+        # `n_layers` is the head count for these blocks (see module docstring).
         self.blocks = nn.ModuleList([
             Block(config=type("Config", (object,), {
                 "n_embd": embed_dim, "n_head": n_layers, "bias": True,
@@ -134,6 +155,7 @@ class Encoder(nn.Module):
                 "attn_window": int(enc_attn_window)}))
             for _ in range(int(enc_layers))
         ])
+        # Convolutional residual stack with zero-initialized output convs.
         k = int(enc_conv_kernel)
         self.conv_blocks = nn.ModuleList()
         for _ in range(int(enc_conv_layers)):
@@ -151,6 +173,7 @@ class Encoder(nn.Module):
             conv = nn.Conv1d(embed_dim, embed_dim, kernel_size=f, stride=f, bias=True)
             with torch.no_grad():
                 conv.weight.zero_()
+                # Identity per channel with 1/f taps == exact average pooling.
                 idx = torch.arange(embed_dim)
                 conv.weight[idx, idx, :] = 1.0 / f
                 conv.bias.zero_()
@@ -179,7 +202,13 @@ class Encoder(nn.Module):
         return x
 
     def forward_nopos(self, idx):
+        """Encoder pass that adds fixed sinusoidal positions instead of learned ones.
+
+        Used when a raw-token prefix needs a contextual encoding without
+        touching the trained positional embedding (``contextual_prefix``).
+        """
         B, T, C = idx.shape[0], idx.shape[1], self.wte.embedding_dim
+        # Standard sine/cosine positional encodings.
         pos = torch.arange(T, device=idx.device, dtype=torch.float32).unsqueeze(1)
         i = torch.arange(0, C, 2, device=idx.device, dtype=torch.float32)
         div = torch.exp(-math.log(10000.0) * i / C)
@@ -233,6 +262,8 @@ class Decoder(nn.Module):
         self.output_layer = nn.Linear(embed_dim, in_vocab_size, bias=False)
         self.ln_f = LayerNorm(embed_dim)
 
+        # Inverse of the encoder's average-pool compression: nearest-neighbour
+        # repeat, initialized as an identity upsampler per channel.
         self.up = None
         if int(compression_factor) > 1:
             f = int(compression_factor)
@@ -246,6 +277,7 @@ class Decoder(nn.Module):
 
 
     def forward(self, z):
+        # z is the quantized latent at the full (pre-compression) length.
         if self.up is not None:
             z = self.up(z.transpose(1, 2)).transpose(1, 2)
         if self.wpe is not None:
@@ -256,9 +288,10 @@ class Decoder(nn.Module):
         x = self.ln_f(x)
         x = self.output_layer(x)
         return x
-    
-    
-if __name__ == "__main__": 
+
+
+if __name__ == "__main__":
+    # Shape smoke test.
     encoder = Encoder(in_vocab_size=1000, context_length=512, compression_factor=1, embed_dim=256, n_layers=1)
     decoder = Decoder(in_vocab_size=1000, embed_dim=256, compression_factor=1, n_layers=1)
 
